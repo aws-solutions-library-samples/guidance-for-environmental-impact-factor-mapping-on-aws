@@ -1,0 +1,8 @@
+boto3==1.24.59
+jupyter==1.0.0
+ipywidgets==8.0.4
+numpy==1.24.2
+pandas==1.5.3
+sentence-transformers==2.2.2
+awscli==1.25.60
+openpyxl==3.1.2
