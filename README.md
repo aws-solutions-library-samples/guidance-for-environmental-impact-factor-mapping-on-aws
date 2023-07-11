@@ -20,9 +20,7 @@ We automate the process of mapping products to their EIO industry sectors based 
 ## Prerequisities
 You will need [python3](https://www.python.org/downloads/) with access to the venv package on your local machine to build and deploy this project.
 
-Follow the steps in [README-CDK](/README-CDK.md) to set up a virtual environment for this project.
-
-You will then need to [bootstrap](https://docs.aws.amazon.com/cdk/v2/guide/getting_started.html#getting_started_bootstrap) your AWS account using the CDK:
+You will need to [bootstrap](https://docs.aws.amazon.com/cdk/v2/guide/getting_started.html#getting_started_bootstrap) your AWS account using the CDK:
 
 `cdk bootstrap aws://ACCOUNT-NUMBER/REGION`
 
@@ -35,6 +33,9 @@ The following diagram depicts the architecture of the CDK stack deployed by this
 ## Deployment
 
 Note that proceeding with these steps will provision AWS resources in your account.
+- `git clone git@github.com:aws-solutions-library-samples/guidance-for-environmental-impact-factor-mapping-on-aws.git`
+- `cd guidance-for-environmental-impact-factor-mapping-on-aws`
+- Follow the steps in [README-CDK](/README-CDK.md) to set up a virtual environment for this project.
 - Run `cdk deploy` (this may take around 10 minutes)
 - Open the AWS console and navigate to Amazon Sagemaker
 - Click on **Notebook instances** under **Notebook** on the left
@@ -43,13 +44,31 @@ Note that proceeding with these steps will provision AWS resources in your accou
 - In the top right select **Terminal** from the **New** dropdown
 - Run the following commands within the new terminal (these steps will take several minutes):
     - `cd SageMaker/EifmNotebookRepo`
-    - `bash ./setup_env.sh`
+    - Create a [conda](https://conda.io/projects/conda/en/latest/index.html) environment, and install the project dependencies within that environment by running the provided Bash script as follows: `bash ./setup_env.sh`
     - After the commands complete, close the browser tab
 - Navigate to the browser tab with Jupyter open
 - Refresh the browser tab. This is needed to allow the newly created environment to appear.
 - Open `walkthrough.ipynb`
 - You should see **conda_demo_environment** selected in the upper right corner
 - You may now run the code in the notebook by clicking **Run All** under the **Cell** menu
+- The output table for the last cell of the notebook should have the following columns:
+    - **product**: The description of the product 
+    - **naics_code**: The 2017 North American Industry Classification System (NAICS) code
+    - **naics_title**: The 2017 NAICS title
+    - **naics_desc**: The 2017 NAICS Index Item Description
+    - **eio_co2**: The supply chain emission factor with margins in kgCO2e/2021 USD
+    - **cosine_score**: The cosine score for this description (the highest of all the descriptions)
+    - **cost**: The cost for this product in 2021 USD
+    - **footprint**: eio_co2 x cost
+- The notebook will write this table as a csv file to the Amazon S3 bucket created during the CDK deployment under the key `outputs/output.csv`
+
+## Next Steps and Additional Resources
+* Read the research paper that this sample code is based on [CaML: Carbon Footprinting of Household Products with Zero-Shot Semantic Text Similarity](https://www.amazon.science/publications/caml-carbon-footprinting-of-household-products-with-zero-shot-semantic-text-similarity)
+* Review the latest datasets from the following pages:
+    * [US Census Bureau North American Industry Classification System Reference Files](https://www.census.gov/naics/?48967) - click on **Downloadable Files** at the bottom of the page. This code uses the **2017 NAICS Index File**.
+    * [US EPA](https://cfpub.epa.gov/si/si_public_record_Report.cfm?dirEntryId=349324&Lab=CESER) - This code uses the **Supply Chain Factors Dataset v1.2**.
+* As described in the [Guidance for Environmental Impact Factor Mapping on AWS
+](https://aws.amazon.com/solutions/guidance/environmental-impact-factor-mapping-on-aws/), a solution can be built using Amazon SageMaker [Batch Transform](https://docs.aws.amazon.com/sagemaker/latest/dg/batch-transform.html) jobs to perform the portions that are shown here in an Amazon SageMaker notebook instance.
 
 ## Security
 
