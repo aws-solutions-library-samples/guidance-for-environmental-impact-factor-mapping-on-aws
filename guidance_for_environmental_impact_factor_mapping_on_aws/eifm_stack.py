@@ -1,14 +1,19 @@
 from aws_cdk import (
     Stack,
-    aws_sagemaker as sagemaker,
+    aws_logs as logs,
     aws_iam as iam,
-    aws_codecommit as codecommit,
-    aws_ssm as ssm,
     aws_s3 as s3,
-    aws_ec2 as ec2,
     aws_s3_deployment as s3_deployment,
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as tasks,
+    aws_glue as glue,
+    aws_bedrock as bedrock,
     RemovalPolicy,
-    Fn
+    Duration,
+    CfnOutput
+)
+from cdklabs.generative_ai_cdk_constructs import (
+    bedrock as bedrock_kb
 )
 from cdk_nag import (
     NagSuppressions
@@ -16,106 +21,419 @@ from cdk_nag import (
 from constructs import Construct
 from os import path
 
+from . import prompts
+
+# LLM Models
+embedding_llm_model_id = bedrock_kb.BedrockFoundationModel.COHERE_EMBED_ENGLISH_V3
+inference_llm_model_id = bedrock.FoundationModelIdentifier.ANTHROPIC_CLAUDE_3_SONNET_20240229_V1_0
+
+# Helper function that retries calls to Bedrock when throttled
+def add_bedrock_retries(task):
+    task.add_retry(
+            max_attempts=5,
+            backoff_rate=2,
+            interval=Duration.seconds(5),
+            errors=["ThrottlingException", "LimitExceededException"]
+    )
 
 class EifmStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
-        notebook_instance_name = "EifmNotebook"
+        #---------------------------------------------------------------------------
+        # CloudWatch log group for Step Function logs
+        #---------------------------------------------------------------------------
+        log_group = logs.LogGroup(self, "EIFMappingLogGroup",
+            log_group_name="EIFMappingLogGroup",
+            removal_policy=RemovalPolicy.DESTROY,
+            retention=logs.RetentionDays.ONE_MONTH
+        )
+        #---------------------------------------------------------------------------
 
-        # vpc for the sagemaker notebook to run in
-        notebook_vpc = ec2.Vpc(self, f"{notebook_instance_name}Vpc",
-                      max_azs=1,
-                   subnet_configuration=[ec2.SubnetConfiguration(
-                       subnet_type=ec2.SubnetType.PUBLIC,
-                       name="Public",
-                   ), ec2.SubnetConfiguration(
-                       subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                       name="Private",
-                   )
-                   ],
-                   nat_gateways=1
-                   )
-
-        # security group for the sagemaker notebook
-        notebook_sg = ec2.SecurityGroup.from_security_group_id(self, f"{notebook_instance_name}SG", notebook_vpc.vpc_default_security_group, mutable=False)
-
-        # interface endpoint for the notebook to use when accessing S3
-        # https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html#accessing-bucket-and-aps-from-interface-endpoints
-        s3_interface_endpoint = notebook_vpc.add_interface_endpoint("S3InterfaceEndpoint", service=ec2.InterfaceVpcEndpointAwsService.S3, security_groups=[notebook_sg], private_dns_enabled=False)
-
-        # repository to hold the sagemaker notebook code stored under source/notebook_source
-        demo_notebook_repo = codecommit.Repository(
-            self, f"{notebook_instance_name}Repo",
-            repository_name=f"{notebook_instance_name}Repo",
-            code=codecommit.Code.from_directory(
-                path.normpath(path.join(__file__, "../../source/notebook_source")))
+        #---------------------------------------------------------------------------
+        # S3 Bucket to hold datasets, input files, and mapping output
+        #---------------------------------------------------------------------------
+        eif_bucket = s3.Bucket(self, "EIFMappingBucket",  
+            enforce_ssl=True,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            server_access_logs_prefix="accesslog/",
+            auto_delete_objects=True, 
+            removal_policy=RemovalPolicy.DESTROY
+        )
+                
+        # Deploy the source datasets, inputs, and Glue script in this repository to the bucket
+        s3_deployment.BucketDeployment(self, "DatasetsDeployment",
+            destination_bucket=eif_bucket,
+            destination_key_prefix="datasets/",
+            sources=[s3_deployment.Source.asset(path.normpath(path.join(__file__, "../assets/datasets/")))]
+        )
+        s3_deployment.BucketDeployment(self, "InputDatasetsDeployment",
+            destination_bucket=eif_bucket,
+            destination_key_prefix="input/",
+            sources=[s3_deployment.Source.asset(path.normpath(path.join(__file__, "../assets/input/")))]
+        )
+        glue_script_deployment = s3_deployment.BucketDeployment(self, "GlueScriptDeployment",
+            destination_bucket=eif_bucket,
+            destination_key_prefix="glue_scripts/",
+            sources=[s3_deployment.Source.asset(path.normpath(path.join(__file__, "../glue_scripts/")))]
         )
 
-        # role that the sagemaker notebook assumes
-        demo_notebook_role = iam.Role(
-            self, f"{notebook_instance_name}Role",
-            assumed_by=iam.ServicePrincipal("sagemaker.amazonaws.com"))
+        #---------------------------------------------------------------------------
+        # Bedrock knowledge base
+        #---------------------------------------------------------------------------
+        kb_role = iam.Role(self, "KnowledgeBaseRole",
+            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com")
+        )
+        kb_role.add_to_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["bedrock:InvokeModel"],
+            resources=[embedding_llm_model_id.as_arn(self)]
+        ))
+        kb = bedrock_kb.KnowledgeBase(self, 'EIFMappingKnowledgeBase',
+            embeddings_model= embedding_llm_model_id,
+            name = "EIFMappingKnowledgeBase",
+            description = "Knowledge base for EIF mapping",
+            existing_role=kb_role
+        )
 
-        # grant the notebook permissions to pull from the CodeCommit repository
-        pull_grant = demo_notebook_repo.grant_pull(demo_notebook_role)
+        CfnOutput(self, "KnowledgeBaseId", value=kb.knowledge_base_id)
 
-        # S3 bucket to hold datasets, inputs, outputs
-        input_output_bucket = s3.Bucket(self, "InputOutputBucket", 
-                                        auto_delete_objects=True, 
-                                        removal_policy=RemovalPolicy.DESTROY, 
-                                        enforce_ssl=True,
-                                        server_access_logs_prefix="accesslog/")
-        
-        # grant the notebook permissions to read and write from this bucket omitting the accesslogs/ prefix
-        input_output_bucket.grant_read_write(demo_notebook_role, "datasets/*")
-        input_output_bucket.grant_read_write(demo_notebook_role, "input/*")
-        input_output_bucket.grant_read_write(demo_notebook_role, "outputs/*")
+        kb_data_source = bedrock_kb.S3DataSource(self, 'KnowledgeBaseDataSource',
+            bucket= eif_bucket,
+            inclusion_prefixes= ["datasets"],
+            knowledge_base=kb,
+            data_source_name='NAICS_Data',
+            chunking_strategy= bedrock_kb.ChunkingStrategy.FIXED_SIZE,
+            max_tokens=50,
+            overlap_percentage=10
+        )
+        CfnOutput(self, "DataSourceId", value=kb_data_source.data_source_id)
 
-        # deploy the files in this repository under source/s3_files to the bucket
-        s3_deployment.BucketDeployment(self, "InputOutputDeployment",
-                                       destination_bucket=input_output_bucket,
-                                       sources=[s3_deployment.Source.asset(path.normpath(path.join(__file__, "../../source/s3_files")))])
+        # Bedrock model for performing mapping
+        inf_model=bedrock.FoundationModel.from_foundation_model_id(self, "MappingModel", inference_llm_model_id)
 
-
-        # create ssm parameters for the s3 interface endpoint url and bucket name so that the notebook can look them up
-        s3_interface_endpoint_url_parameter = ssm.StringParameter(self, "S3InterfaceEndpointParameter", string_value=Fn.join("", ["https://bucket", Fn.select(1, Fn.split("*", Fn.select(0, s3_interface_endpoint.vpc_endpoint_dns_entries), assumed_length=2))]), parameter_name="s3-interface-endpoint-url")
-        s3_interface_endpoint_url_parameter.grant_read(demo_notebook_role)
-        input_output_bucket_parameter = ssm.StringParameter(self, "InputOutputBucketParameter", string_value=input_output_bucket.bucket_name, parameter_name="input-output-bucket-name")
-        input_output_bucket_parameter.grant_read(demo_notebook_role)
-
-        # policy to let the notebook log to cloudwatch
-        cloudwatch_logging_policy = iam.Policy(
+        #---------------------------------------------------------------------------
+        # Glue job
+        #---------------------------------------------------------------------------
+        # Create IAM role for Glue job
+        glue_role = iam.Role(self, "GlueJobRole",
+            assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSGlueServiceRole")
+            ]
+        )
+        # Add inline policy for S3 access
+        glue_role.add_to_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"],
+            resources=[
+                eif_bucket.bucket_arn,
+                eif_bucket.arn_for_objects("*")
+            ]
+        ))
+        glue_job = glue.CfnJob(self, "CreateGlueCleaningJob",
+            command=glue.CfnJob.JobCommandProperty(
+                name="glueetl",
+                python_version="3",
+                script_location="s3://{}/glue_scripts/format_output.py".format(eif_bucket.bucket_name)
+            ),
+            name="eif-cleaning-job",
+            role=glue_role.role_arn,
+            number_of_workers=2,
+            worker_type="G.1X"
+        )
+        glue_job.node.add_dependency(glue_script_deployment)
+   
+        #---------------------------------------------------------------------------
+        # Step Functions
+        #---------------------------------------------------------------------------
+        # Step 1: Clean activity description using LLM
+        clean_activity_description = tasks.BedrockInvokeModel(
             self,
-            "CloudWatchLoggingPolicy",
-            statements=[iam.PolicyStatement(effect=iam.Effect.ALLOW, actions=["logs:CreateLogGroup",
-                                                                              "logs:CreateLogStream",
-                                                                              "logs:PutLogEvents"], resources=[f"arn:aws:logs:{self.region}:{self.account}:log-group:/aws/sagemaker/NotebookInstances:log-stream:{notebook_instance_name}/*"])]
+            "CleanActivityDescription",
+            model=inf_model,
+            body=sfn.TaskInput.from_object(
+                {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 500,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": sfn.JsonPath.format(
+                                        prompts.clean_text_prompt,
+                                        sfn.JsonPath.string_at("$.Commodity"),
+                                        sfn.JsonPath.string_at("$.CommodityDescription"),
+                                        sfn.JsonPath.string_at("$.ExtendedDescription"),
+                                        sfn.JsonPath.string_at("$.ContractName")
+                                    )
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ),
+            result_selector={
+                "SimplifiedDescription.$": "$.Body.content[0].text"
+            },
+            result_path= "$.CleanedActivity"
         )
-        # attach that policy
-        cloudwatch_logging_policy.attach_to_role(demo_notebook_role)
+        add_bedrock_retries(clean_activity_description)
 
-        # create the notebook instance
-        notebook = sagemaker.CfnNotebookInstance(
-            self, notebook_instance_name,
-            notebook_instance_name=notebook_instance_name,
-            instance_type="ml.g4dn.xlarge",
-            platform_identifier="notebook-al2-v2",
-            default_code_repository=demo_notebook_repo.repository_clone_url_http,
-            role_arn=demo_notebook_role.role_arn,
-            security_group_ids=[notebook_sg.security_group_id],
-            subnet_id=notebook_vpc.private_subnets[0].subnet_id,
-            direct_internet_access='Disabled'
+        # Step 2: Match activity to possible NAICS descriptions and codes using knowledge base
+        generate_possible_matches = tasks.CallAwsService(
+            self,
+            "GeneratePossibleEIFMatches",
+            service="bedrockagentruntime",
+            action="retrieveAndGenerate",
+            parameters={
+                "Input": {
+                    "Text": sfn.JsonPath.format("{}", sfn.JsonPath.string_at("$.CleanedActivity.SimplifiedDescription"))
+                },
+                "RetrieveAndGenerateConfiguration": {
+                "KnowledgeBaseConfiguration": {
+                  "GenerationConfiguration": {
+                    "InferenceConfig": {
+                      "TextInferenceConfig": {
+                        "MaxTokens": 512,
+                        "Temperature": 0,
+                        "TopP": 1
+                      }
+                    },
+                    "PromptTemplate": {
+                      "TextPromptTemplate": prompts.possible_eio_matches_system_prompt
+                    }
+                  },
+                  "KnowledgeBaseId": kb.knowledge_base_id,
+                  "ModelArn": inf_model.model_arn,
+                  "RetrievalConfiguration": {
+                    "VectorSearchConfiguration": {
+                      "NumberOfResults": 3
+                    }
+                  }
+                },
+                "Type": "KNOWLEDGE_BASE"
+              }
+            },
+            result_selector={
+                "NAICSOptions": sfn.JsonPath.string_to_json("$.Output.Text")
+            },
+            result_path= "$.PossibleMatches",
+            iam_resources=["*"]
+        )
+        add_bedrock_retries(generate_possible_matches)
+
+        # Step 3: Choose best EIF match from possible choices using LLM
+        choose_best_eif_match = tasks.BedrockInvokeModel(
+            self,
+            "ChooseBestEIFMatch",
+            model=inf_model,
+            body=sfn.TaskInput.from_object(
+                {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 500,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": sfn.JsonPath.format(
+                                        prompts.best_eif_prompt,
+                                        sfn.JsonPath.string_at("$.CleanedActivity.SimplifiedDescription"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSCode1"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSTitle1"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSCode2"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSTitle2"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSCode3"),
+                                        sfn.JsonPath.string_at("$.PossibleMatches.NAICSOptions.NAICSTitle3")
+                                    )
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ),
+            result_selector={
+                "BestChoice.$": "States.StringToJson($.Body.content[0].text)"
+            },
+            result_path= "$.MappedEIF"
+        )
+        add_bedrock_retries(choose_best_eif_match)
+
+        # Step 4: Format output for later use
+        format_output = sfn.Pass(
+            self,
+            "FormatOutput",
+            parameters={
+                "Commodity.$": "$.Commodity",
+                "CommodityDescription.$": "$.CommodityDescription",
+                "ExtendedDescription.$": "$.ExtendedDescription",
+                "ContractName.$": "$.ContractName",
+                "SimplifiedDescription.$": "$.CleanedActivity.SimplifiedDescription",
+                "PossibleMatches.$": "$.PossibleMatches.NAICSOptions",
+                "MappedNAICSCode.$": "$.MappedEIF.BestChoice.BestNAICSCode",
+                "MappedNAICSTitle.$": "$.MappedEIF.BestChoice.BestNAICSTitle",
+                "MappingJustification.$": "$.MappedEIF.BestChoice.Justification"
+                }
         )
 
-        # The notebook cannot be deployed until its role has been granted permissions to pull from the repository
-        notebook.node.add_dependency(pull_grant)
+        ### Loop mapping steps over each record in input file
+        eif_mapping_chain = (
+            sfn.Chain.start(clean_activity_description)
+            .next(generate_possible_matches)
+            .next(choose_best_eif_match)
+            .next(format_output)
+        )
+        eif_mapping = sfn.DistributedMap(
+            self,
+            "MapEmissionsFactors",
+            label="MapEmissionsFactors",
+            map_execution_type= sfn.StateMachineType.STANDARD,
+            max_concurrency=5,
+            tolerated_failure_percentage=10,
+            item_reader=sfn.S3CsvItemReader(
+                bucket=eif_bucket,
+                key="input/activities.csv",
+                csv_headers=sfn.CsvHeaders.use_first_row()
+            ),
+            item_selector={
+                "Commodity.$": "$$.Map.Item.Value.Commodity",
+                "CommodityDescription.$": "$$.Map.Item.Value.CommodityDescription",
+                "ExtendedDescription.$": "$$.Map.Item.Value.ExtendedDescription",
+                "ContractName.$": "$$.Map.Item.Value.ContractName"
+            },
+            result_writer=sfn.ResultWriter(
+                bucket=eif_bucket,
+                prefix="mapping-runs"
+            )
+        ).item_processor(eif_mapping_chain)
 
+        ### The Glue job that cleans and merges the mapped activities into a single output file requires the source bucket to have all the same data format.
+        # Read the output manifest to determine how many output files there are
+        read_manifest = tasks.CallAwsService(
+            self,
+            "ReadMapExecutionManifest",
+            service="s3",
+            action="getObject",
+            parameters={
+                "Bucket.$": "$.ResultWriterDetails.Bucket",
+                "Key.$": "$.ResultWriterDetails.Key"
+            },
+            result_selector={
+                "Manifest.$": "States.StringToJson($.Body)"
+            },
+            output_path="$.Manifest",
+            iam_resources=[eif_bucket.arn_for_objects("*")]
+        )
+
+        # Move the successful matches to a new prefix for the Glue job
+        move_output = tasks.CallAwsService(
+            self,
+            "CopyObjectToProcessingPrefix",
+            service="s3",
+            action="copyObject",
+            parameters={
+                "Bucket.$": "$.Bucket",
+                "CopySource": sfn.JsonPath.format("{}/{}", sfn.JsonPath.string_at("$.Bucket"), sfn.JsonPath.string_at("$.SourceKey")),
+                "Key": sfn.JsonPath.format("successful-mappings/SUCCEEDED_{}.json", sfn.JsonPath.string_at("$.DestinationKey"))
+            },
+            iam_resources=[eif_bucket.arn_for_objects("*")]
+        )
+        move_successes = sfn.Map(
+            self,
+            "MoveSuccessfulRunsToProcessingPrefix",
+            items_path="$.ResultFiles.SUCCEEDED",
+            item_selector={
+                "Bucket.$": "$.DestinationBucket",
+                "SourceKey.$": "$$.Map.Item.Value.Key",
+                "DestinationKey.$": "$$.Map.Item.Index"
+            }
+        ).item_processor(move_output)
+
+        # Clean mapped factors into human readable CSV
+        run_glue_job = tasks.GlueStartJobRun(
+            self,
+            "CleanSuccessfulMappedFactors",
+            glue_job_name=glue_job.name,
+            arguments=sfn.TaskInput.from_object({
+                "--EIF_bucket": eif_bucket.bucket_name
+            })
+        )
+
+        ### Put all the steps together into the complete state machine
+        full_chain = eif_mapping.next(read_manifest.next(move_successes.next(run_glue_job)))
+        eif_sfn = sfn.StateMachine(
+            self,
+            "EIFMappingStateMachine",
+            state_machine_name="EIFMapping",
+            definition_body=sfn.DefinitionBody.from_chainable(full_chain),
+            removal_policy=RemovalPolicy.DESTROY,
+            tracing_enabled=True,
+            logs=sfn.LogOptions(
+                destination=log_group,
+                level=sfn.LogLevel.ALL
+            )
+        )
+        eif_bucket.grant_read_write(eif_sfn.role)
+        eif_sfn.role.add_to_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["bedrock:RetrieveAndGenerate", "bedrock:Retrieve"],
+            resources=[kb.knowledge_base_arn]
+        ))
+        CfnOutput(self, "StateMachineARN", value=eif_sfn.state_machine_arn)
+
+        #---------------------------------------------------------------------------
         # cdk-nag suppressions
-        NagSuppressions.add_resource_suppressions(notebook_vpc, [{"id": "AwsSolutions-VPC7", "reason": "No flow logs for demo purposes."}])
-        NagSuppressions.add_resource_suppressions(demo_notebook_role, [{"id": "AwsSolutions-IAM5", "reason": "grant_read_write uses wildcard"}], True)
-        NagSuppressions.add_resource_suppressions_by_path(self, ["/EifmStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/DefaultPolicy/Resource", "/EifmStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/Resource", "/EifmStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/Resource"], [{"id": "AwsSolutions-IAM4", "reason": "Configured by cdk construct"}, {"id": "AwsSolutions-IAM5", "reason": "Configured by cdk construct"}, {"id": "AwsSolutions-L1", "reason": "Configured by cdk construct"}])
-        NagSuppressions.add_resource_suppressions(cloudwatch_logging_policy, [{"id": "AwsSolutions-IAM5", "reason": "Resources are restricted to notebook instance."}])
-        NagSuppressions.add_resource_suppressions(notebook, [{"id": "AwsSolutions-SM2", "reason": "Using default encryption settings"}])
-        
+        #---------------------------------------------------------------------------
+        NagSuppressions.add_resource_suppressions_by_path(self, 
+            path=[
+                "/EIFMappingStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/DefaultPolicy/Resource",
+                "/EIFMappingStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/Resource",
+                "/EIFMappingStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/Resource",
+                "/EIFMappingStack/LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/ServiceRole/Resource",
+                "/EIFMappingStack/LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/ServiceRole/DefaultPolicy/Resource"
+            ], 
+            suppressions=[
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": "Configured by cdk construct"
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "Configured by cdk construct"
+                },
+                {
+                    "id": "AwsSolutions-L1",
+                    "reason": "Configured by cdk construct"
+                }
+            ]
+        )
+        NagSuppressions.add_resource_suppressions(
+            construct=glue_role,
+            suppressions=[
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": "Glue job needs managed policy AWSGlueServiceRole to function"
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "Glue job interacts with all objects in bucket"
+                }
+            ],
+            apply_to_children=True
+        )
+        NagSuppressions.add_resource_suppressions(
+            construct=eif_sfn,
+            suppressions=[
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "Configured by construct"
+                }
+            ],
+            apply_to_children=True
+        )

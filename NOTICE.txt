@@ -10,14 +10,9 @@ THIRD PARTY COMPONENTS
 **********************
 This software includes third party software subject to the following copyrights:
 
-"aws-cdk-lib==2.53.0", "Apache-2.0", "https://github.com/aws/aws-cdk"
+"aws-cdk-lib==2.155.0", "Apache-2.0", "https://github.com/aws/aws-cdk"
 "constructs>=10.0.0,<11.0.0", "Apache-2.0", "https://github.com/aws/constructs"
-"cdk-nag==2.27.38", "Apache-2.0", "https://github.com/cdklabs/cdk-nag"
+"cdklabs.generative-ai-cdk-constructs==0.1.254", "Apache-2.0", "https://github.com/awslabs/generative-ai-cdk-constructs"
+"cdk-nag==2.28.192", "Apache-2.0", "https://github.com/cdklabs/cdk-nag"
 "boto3==1.24.59", "Apache-2.0", "https://github.com/boto/boto3"
-"jupyter==1.0.0", "BSD-3-Clause", "https://github.com/jupyter/jupyter"
-"ipywidgets==8.0.4", "BSD-3-Clause", "https://github.com/jupyter-widgets/ipywidgets"
-"numpy==1.24.2", "BSD-3-Clause", "https://github.com/numpy/numpy"
-"pandas==1.5.3", "BSD-3-Clause", "https://github.com/pandas-dev/pandas"
-"sentence-transformers==2.2.2", "Apache-2.0", "https://github.com/UKPLab/sentence-transformers"
-"awscli==1.25.60", "Apache-2.0", "https://github.com/aws/aws-cli"
-"openpyxl==3.1.2", "MIT", "https://foss.heptapod.net/openpyxl/openpyxl"
+"awscli==2.17.41", "Apache-2.0", "https://github.com/aws/aws-cli"
