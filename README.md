@@ -1,3 +1,6 @@
+# ⚠️ Deprecation Warning
+This repository is no longer maintained as of July 2026.
+
 ## Introduction
 
 This code is an example deployment of the [Guidance for Environmental Impact Factor Mapping on AWS](https://aws.amazon.com/solutions/guidance/environmental-impact-factor-mapping-on-aws/). It is intended to demonstrate how to use semantic text matching with large language models to perform emission factor matching. It accepts a single CSV of business activities and outputs a single CSV containing the mapped emissions factors.
